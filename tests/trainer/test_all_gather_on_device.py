@@ -32,6 +32,7 @@ Multi-rank equivalence (the broadcast actually lining up across ranks) is not co
 here; it needs a distributed harness.
 """
 
+import inspect
 import unittest
 
 import numpy as np
@@ -44,7 +45,6 @@ from paddleformers.trainer.utils.reshard.common import (
     AssignedMasterWeight,
     all_gather_on_device,
     all_gather_state_dict,
-    set_bucketed_broadcast,
     set_device_gather,
 )
 
@@ -85,13 +85,11 @@ class TestAllGatherOnDevice(unittest.TestCase):
     def setUp(self):
         self.group = _SingleRankGroup()
         self._old_bucket = reshard_common._STATE_DICT_BROADCAST_BUCKET_SIZE_BYTES
-        self._old_bucketed = reshard_common._USE_BUCKETED_BROADCAST
         # small budget so the fixtures really produce several buckets and chunks
         self.chunk = 4 * 1024
 
     def tearDown(self):
         reshard_common._STATE_DICT_BROADCAST_BUCKET_SIZE_BYTES = self._old_bucket
-        set_bucketed_broadcast(self._old_bucketed)
 
     def _sources(self):
         return {name: _rand_bf16(shape, seed) for seed, (name, shape) in enumerate(SHAPES.items())}
@@ -101,7 +99,6 @@ class TestAllGatherOnDevice(unittest.TestCase):
 
     def _host_reference(self):
         """Ground truth from the untouched bucketed host path."""
-        set_bucketed_broadcast(True)
         reshard_common._STATE_DICT_BROADCAST_BUCKET_SIZE_BYTES = self.chunk
         reshard_common.set_broadcast_max_chunk_bytes(self.chunk * 2)
         out = all_gather_state_dict({k: v.cpu() for k, v in self._sources().items()}, lambda x: True, self.group)
@@ -221,16 +218,14 @@ class TestDeviceGatherSwitch(unittest.TestCase):
         set_device_gather(False)
         self.assertIsNone(_restore_master_weights_2d_on_device({}, _SingleRankGroup(), {}))
 
-    def test_independent_of_the_bucketed_broadcast_switch(self):
-        """all_gather_on_device does not go through the all_gather_state_dict dispatcher."""
-        old = reshard_common._USE_BUCKETED_BROADCAST
-        try:
-            set_device_gather(True)
-            for bucketed in (False, True):
-                set_bucketed_broadcast(bucketed)
-                self.assertTrue(reshard_common.use_device_gather())
-        finally:
-            set_bucketed_broadcast(old)
+    def test_does_not_go_through_all_gather_state_dict(self):
+        """The device path reuses the bucket kernel directly, not the host entry point."""
+        src = inspect.getsource(reshard_common.all_gather_on_device)
+        doc = reshard_common.all_gather_on_device.__doc__ or ""
+        body = src.replace(doc, "")  # the docstring mentions the host entry point by name
+        self.assertNotIn("all_gather_state_dict", body)
+        for helper in ("_build_state_dict_broadcast_buckets", "_iter_state_dict_bucket_chunks"):
+            self.assertIn(helper, body)
 
 
 if __name__ == "__main__":

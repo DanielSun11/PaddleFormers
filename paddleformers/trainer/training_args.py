@@ -743,28 +743,15 @@ class TrainingArguments:
         metadata={"help": "Whether to load sharded model from EMA."},
     )
 
-    use_reshard_bucketed_broadcast: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "During checkpoint reshard, pack many small state tensors into large buckets and "
-                "coalesce their broadcasts, reducing NCCL/H2D calls from O(#tensors) to O(#buckets). "
-                "This speeds up reshard at large sharding degree but raises peak GPU memory, since a "
-                "chunk (~2GiB) stays resident on device during broadcast. Default False (per-tensor path)."
-            )
-        },
-    )
-
     reshard_bucketed_broadcast_max_chunk_gb: float = field(
         default=2.0,
         metadata={
             "help": (
-                "Only used when use_reshard_bucketed_broadcast is True. Max size (in GB, 1024**3 bytes) of a "
-                "broadcast chunk kept resident on GPU at once. Values below the 128MiB bucket size are floored "
+                "Max size (in GB, 1024**3 bytes) of a broadcast chunk kept resident on GPU at once "
+                "during checkpoint reshard. Values below the 128MiB bucket size are floored "
                 "to it. Default 2.0. NOTE: this only caps the AGGREGATION of multiple buckets into one chunk; "
                 "it does not split a single tensor/bucket. A tensor larger than this cap is still transmitted "
-                "whole (one bucket), exactly like the non-bucketed path, so peak is not reduced for such tensors "
-                "(bucketing is no worse than per-tensor here, just not better)."
+                "whole (one bucket), so peak is not reduced for such tensors."
             )
         },
     )
@@ -1728,6 +1715,18 @@ class TrainingArguments:
                 "Each element is a list/tuple of [a, b, c]. "
                 "Example: [[3.4445, -4.7750, 2.0315], [2.5, -2.0, 0.8]]. "
                 "Default: None. Only used when optim=muon, muon_ns_coeff_type='custom'."
+            )
+        },
+    )
+    muon_use_symmetric_gemm: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to compute the two symmetric matmuls of each Newton-Schulz step with "
+                "quack's SYRK-style gemm_symmetric kernel, which only evaluates the lower triangle "
+                "and mirrors it back. Requires bfloat16/float16 Newton-Schulz matmuls, an importable "
+                "quack, and compute capability 9.x/10.x/11.x. "
+                "Default: False. Only used when optim=muon."
             )
         },
     )
