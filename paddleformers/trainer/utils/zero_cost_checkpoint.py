@@ -137,11 +137,11 @@ class ZCCWorkerStatus(Enum):
     ERROR = 3
 
 
-# trial_params 中体积大的数据进度数组，见 ZeroCostCheckpointCallback._state_for_worker
+# Large data-progress arrays in trial_params, see ZeroCostCheckpointCallback._state_for_worker
 _ZCC_DATA_STATUS_KEYS = ("data_status", "saved_data_status", "last_start_data_status")
-# 占位：与上次发送的是同一对象，worker 用缓存补回（用字符串以便跨进程按值比较）
+# Placeholder: same object as last sent, restored from the worker cache (a str compares by value across processes)
 _LAST_START_UNCHANGED = "__zcc_last_start_data_status_unchanged__"
-# saved_data_status 以 (标记, 基线或占位, diff_ids, diff_cnts) 发送，worker 还原为 基线 + 增量
+# saved_data_status sent as (tag, base or placeholder, diff_ids, diff_cnts); the worker rebuilds base + diff
 _SAVED_BASE_PLUS_DIFF = "__zcc_saved_data_status_base_plus_diff__"
 
 
@@ -400,7 +400,7 @@ class ZeroCostCheckpointEMAProcessor:
                 dtype="float32",
             )
             # ema model params, only works on float32 model weights (aka, moe gates)
-            # cpu_buf 可能是 pinned，zeros_like 会分配到 GPU 上，这里显式在 CPU 上分配
+            # cpu_buf may be pinned and zeros_like would allocate on GPU, so allocate on CPU explicitly
             ema_buffer_model_params = {
                 k: paddle.zeros(cpu_buf.shape, dtype=cpu_buf.dtype)
                 for k, (cuda_buf, cpu_buf) in self.param_fusion_storage_helper.inited_buffers.items()
@@ -439,7 +439,7 @@ class ZeroCostCheckpointEMAProcessor:
                 self.ema_buffer.lerp_(cpu_master_weights, 1 - self.ema_coef)
                 for index, ema_buf in self.ema_buffer_model_params.items():
                     _, cpu_buf = self.param_fusion_storage_helper.inited_buffers[index]
-                    # 原地 lerp_，避免表达式求值产生临时张量
+                    # In-place lerp_ avoids temporaries from expression evaluation
                     ema_buf.lerp_(cpu_buf, 1 - self.ema_coef)
                 logger.info(
                     f"[ZCC EMA] accmulating, buffer type:{self.ema_buffer.place} {self.ema_buffer.dtype}, done"
@@ -597,7 +597,7 @@ class ParamFusionStorageHelper:
         else:
             cuda_buffer = paddle.to_tensor(paddle.base.core.LoDTensor._new_shared_cuda(meta))
         if flatten and not paddle.is_compiled_with_xpu():
-            # pinned 内存，D2H 不经过驱动的 pageable 中转
+            # Pinned memory: D2H skips the driver's pageable staging copy
             cpu_buffer = cuda_buffer.pin_memory()
         else:
             cpu_buffer = cuda_buffer.cpu()
@@ -754,14 +754,16 @@ class ZeroCostCheckpointCallback(TrainerCallback):
             logger.info("[ZCC manager] Synced checkpoints.")
 
     def _state_for_worker(self, state, dumping=True):
-        """给 worker 的 TrainerState 快照，去掉或压缩 trial_params 里的大数组，减少 PREPARE 的 pickle 开销。
+        """TrainerState snapshot for the worker with the large trial_params arrays dropped or compressed,
+        to cut the pickling cost of the PREPARE task.
 
-        - data_status 不发（已并入 saved_data_status，续训时会重建）；
-        - 不写 trainer_state 的 rank（device_id != 0）和纯 EMA 步，三个数组都不发；
-        - 单 worker：last_start_data_status 不变时发占位；saved_data_status 在数据侧提供
-          _zcc_saved_base / _zcc_saved_diff 时发「基线（不变则占位）+ 累计增量」，由 worker 还原；
-        - 多 worker：worker 间缓存不一致，始终发完整数组；会被原地更新的 saved 发拷贝，避免 feeder 线程异步
-          pickle 时读到半更新的数据。
+        - data_status is never sent (already merged into saved_data_status, rebuilt on resume);
+        - ranks that do not write trainer_state (device_id != 0) and EMA-only steps get none of the arrays;
+        - single worker: last_start_data_status is replaced by a placeholder when unchanged; saved_data_status
+          is sent as "base (placeholder when unchanged) + accumulated diff" when the data side provides
+          _zcc_saved_base / _zcc_saved_diff, and rebuilt by the worker;
+        - multiple workers: their caches may differ, so full arrays are always sent; a saved_data_status that is
+          updated in place is copied so the asynchronous feeder-thread pickle never sees a partial update.
         """
         tp = getattr(state, "trial_params", None)
         if not isinstance(tp, dict) or not any(k in tp for k in _ZCC_DATA_STATUS_KEYS):
@@ -825,7 +827,8 @@ class ZeroCostCheckpointCallback(TrainerCallback):
             self.manager.get_idle_worker_for_saving((save_infos, non_cached_objects))
             self.runtime_timer.stop()
             if not (args.pipeline_model_parallel_size > 1 and isinstance(model, PipelineLayer)):
-                # D2H 推迟到步尾日志之后由 flush_deferred_offload 发起，避免与日志中的小通信争抢 PCIe
+                # Defer D2H to flush_deferred_offload after step-tail logging so it does not compete for PCIe
+                # with the small collectives in logging
                 self.manager.offload_deferred = True
 
     def get_rng_states(self, args):
@@ -1178,7 +1181,7 @@ class ZeroCostCheckpointManager:
         logger.info("[ZCC manager] Synced checkpoints (step begin).")
 
     def sync_offload_status(self):
-        # 先发出尚未发起的 OFFLOAD，避免死等
+        # Issue a still-deferred OFFLOAD first, otherwise this would wait forever
         self.flush_deferred_offload()
         self.report_error_worker()
         assert self.current_worker is not None, "[ZCC manager] current_worker must not be None"
@@ -1206,7 +1209,7 @@ class ZeroCostCheckpointManager:
                 raise RuntimeError(f"{PC_DUMP_ERROR}")
 
     def flush_deferred_offload(self):
-        """发起 save 步推迟的 OFFLOAD；没有推迟的任务时不做任何事。"""
+        """Issue the OFFLOAD deferred by the save step; no-op if nothing is pending."""
         if not getattr(self, "offload_deferred", False):
             return
         self.offload_deferred = False
@@ -1248,7 +1251,7 @@ def worker_loop(worker):
 
 
 def _zcc_is_flash_dir(output_dir):
-    """是否为 flash（tmpfs）目录。"""
+    """Whether output_dir is on the flash (tmpfs) device."""
     return str(output_dir).startswith(FLASH_DEVICE)
 
 
@@ -1347,7 +1350,7 @@ class ZeroCostCheckpointWorker:
         self._restore_trainer_state()
 
     def _restore_trainer_state(self):
-        """还原 _state_for_worker 的压缩：占位用缓存补回，saved_data_status 由 基线 + 增量 还原。"""
+        """Undo _state_for_worker: fill placeholders from the cache and rebuild saved_data_status as base + diff."""
         tp = getattr(self.trainer_state, "trial_params", None)
         if not isinstance(tp, dict):
             return
@@ -1388,7 +1391,7 @@ class ZeroCostCheckpointWorker:
             self._cached_last_start_data_status = value
 
     def _issue_offload_range(self, start, size):
-        """发起逻辑区间 [start, start+size) 的 D2H：前段是优化器 fused states，后段是模型权重。"""
+        """Issue D2H for logical range [start, start+size): optimizer fused states first, then model weights."""
         opt_len = self.optimizer_fusion_storage_helper.buffer_length
         end = start + size
         if start < opt_len:
@@ -1397,13 +1400,13 @@ class ZeroCostCheckpointWorker:
             self.param_fusion_storage_helper.sync_partial_param(numel_to_sync=end - max(start, opt_len))
 
     def _drain_offload_tasks(self):
-        """等待已发起的拷贝完成，收尾逻辑仍留给 wait_all。"""
+        """Wait for issued copies; the final bookkeeping is left to wait_all."""
         for helper in (self.optimizer_fusion_storage_helper, self.param_fusion_storage_helper):
             while helper.tasks:
                 helper.tasks.pop(0).cpu_wait()
 
     def _chunked_offload(self, size, chunk_mb):
-        """分块发起 D2H，每块完成后再发下一块，给同一 PCIe 链路上的跨机通信留出空档。"""
+        """Issue D2H chunk by chunk, leaving PCIe gaps for cross-node communication on the same link."""
         elem = self.optimizer_fusion_storage_helper.buffer.element_size()
         block = max(1, int(chunk_mb * 1024 * 1024 / elem))
         start, end = self.offloaded_numels, self.offloaded_numels + size
@@ -3087,18 +3090,18 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
     def _dump_states(self, output_dir):
         flash = _zcc_is_flash_dir(output_dir)
         self._pending_writes = []
-        # _save_* 只做 CPU 侧变换并排队写入，统一在 _flush_writes 落盘
+        # _save_* only transform on CPU and queue writes; _flush_writes does the I/O
         self._save_model_state(output_dir)
         self._save_opt_state(output_dir)
         self._save_ema_state(output_dir)
         self._flush_writes(flash)
 
     def _queue_write(self, obj, path):
-        """登记一次 paddle.save，由 _flush_writes 统一执行。"""
+        """Queue a paddle.save to be run by _flush_writes."""
         self._pending_writes.append((obj, path))
 
     def _flush_writes(self, flash):
-        """flash（tmpfs）用线程池并发写；persistent 串行写，并发会打散顺序写反而更慢。"""
+        """Write flash (tmpfs) files concurrently; keep persistent writes serial to preserve sequential I/O."""
         jobs, self._pending_writes = self._pending_writes, []
 
         def run(job):
@@ -3106,7 +3109,7 @@ class ZeroCostCheckpointWorkerFcBased(ZeroCostCheckpointWorker):
             paddle.save(obj, path)
 
         if flash and len(jobs) > 1:
-            # 只并行 paddle.save；device_guard 修改全局设备，CPU 侧变换不能放进线程池
+            # Only paddle.save runs in threads: device_guard changes the global device, so CPU transforms stay here
             with ThreadPoolExecutor(max_workers=min(4, len(jobs)), thread_name_prefix="zcc-dump") as ex:
                 for fut in [ex.submit(run, j) for j in jobs]:
                     fut.result()

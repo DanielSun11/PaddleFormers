@@ -153,7 +153,7 @@ class TrainerState:
     def save_to_json(self, json_path: str):
         """Save the content of this instance in JSON format inside `json_path`."""
 
-        # trial_params 中可能有 numpy 数组
+        # trial_params may contain numpy arrays
         def _np_default(o):
             if isinstance(o, np.ndarray):
                 return o.tolist()
